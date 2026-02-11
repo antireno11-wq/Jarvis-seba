@@ -8,26 +8,38 @@ const app = express();
 app.use(express.json());
 
 const token = process.env.TELEGRAM_BOT_TOKEN;
+
 if (!token) {
   console.error("No TELEGRAM_BOT_TOKEN found.");
   process.exit(1);
 }
 
-// Importante: indicar que usaremos webhook
+// Configuración webhook
 const bot = new TelegramBot(token, { webHook: true });
 
-// Endpoint fijo (sin token en la URL)
+// Endpoint webhook FIJO (sin token en URL)
 app.post("/webhook", (req, res) => {
-  // Log mínimo para debug
   console.log("Incoming update:", JSON.stringify(req.body));
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
+// Endpoint raíz
+app.get("/", (req, res) => {
+  res.status(200).send("Jarvis is alive");
+});
+
+// Endpoint healthcheck para Railway
+app.get("/health", (req, res) => {
+  res.status(200).send("ok");
+});
+
+// Comando /start
 bot.onText(/\/start/i, (msg) => {
   bot.sendMessage(msg.chat.id, "Jarvis operativo. Dime 'hola' para probar.");
 });
 
+// Respuesta básica
 bot.on("message", (msg) => {
   const chatId = msg.chat.id;
   const text = msg.text;
@@ -41,12 +53,9 @@ bot.on("message", (msg) => {
   }
 });
 
-app.get("/", (req, res) => {
-  res.send("Jarvis is alive");
-});
-
 const PORT = process.env.PORT || 8080;
 
-app.listen(PORT, () => {
+// MUY IMPORTANTE: escuchar en 0.0.0.0
+app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
