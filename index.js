@@ -24,6 +24,10 @@ app.post("/webhook", (req, res) => {
   res.sendStatus(200);
 });
 
+app.get("/webhook", (req, res) => {
+  res.status(200).send("webhook endpoint alive");
+});
+
 // Endpoint raíz
 app.get("/", (req, res) => {
   res.status(200).send("Jarvis is alive");
