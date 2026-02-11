@@ -14,52 +14,43 @@ if (!token) {
   process.exit(1);
 }
 
-// Configuración webhook
-const bot = new TelegramBot(token, { polling: true });
+// Webhook mode
+const bot = new TelegramBot(token);
 
-// Endpoint webhook FIJO (sin token en URL)
-
-  console.log("Incoming update:", JSON.stringify(req.body));
+app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
 
-app.get("/webhook", (req, res) => {
-  res.status(200).send("webhook endpoint alive");
-});
-
-// Endpoint raíz
-app.get("/", (req, res) => {
-  res.status(200).send("Jarvis is alive");
-});
-
-// Endpoint healthcheck para Railway
+// Health check
 app.get("/health", (req, res) => {
   res.status(200).send("ok");
 });
 
-// Comando /start
-bot.onText(/\/start/i, (msg) => {
-  bot.sendMessage(msg.chat.id, "Jarvis operativo. Dime 'hola' para probar.");
+// Root
+app.get("/", (req, res) => {
+  res.send("Jarvis is alive");
 });
 
-// Respuesta básica
-bot.on("message", (msg) => {
-  const chatId = msg.chat.id;
-  const text = msg.text;
+bot.on("message", async (msg) => {
+  try {
+    const chatId = msg.chat.id;
+    const text = msg.text;
 
-  if (!text) return;
+    if (!text) return;
 
-  if (text.toLowerCase().includes("hola")) {
-    bot.sendMessage(chatId, "Hola Seba. Jarvis operativo.");
-  } else {
-    bot.sendMessage(chatId, `Recibido: ${text}`);
+    if (text.toLowerCase().includes("hola")) {
+      await bot.sendMessage(chatId, "Hola Seba. Jarvis operativo.");
+    } else {
+      await bot.sendMessage(chatId, `Recibido: ${text}`);
+    }
+  } catch (err) {
+    console.error("Error sending message:", err);
   }
 });
 
 const PORT = process.env.PORT || 8080;
 
-// MUY IMPORTANTE: escuchar en 0.0.0.0
 app.listen(PORT, "0.0.0.0", () => {
   console.log(`Server running on port ${PORT}`);
 });
