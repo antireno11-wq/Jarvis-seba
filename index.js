@@ -15,10 +15,10 @@ if (!token) {
 }
 
 // Configuración webhook
-const bot = new TelegramBot(token, { webHook: true });
+const bot = new TelegramBot(token, { polling: true });
 
 // Endpoint webhook FIJO (sin token en URL)
-app.post("/webhook", (req, res) => {
+
   console.log("Incoming update:", JSON.stringify(req.body));
   bot.processUpdate(req.body);
   res.sendStatus(200);
