@@ -3,7 +3,6 @@ import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 import { google } from "googleapis";
 import * as chrono from "chrono-node";
-import { zonedTimeToUtc } from "date-fns-tz";
 
 dotenv.config();
 
@@ -51,25 +50,21 @@ function getGoogleAuth(telegramUserId) {
   return client;
 }
 
-// ===== Helpers NL Dates =====
+// ===== Helpers: lenguaje natural =====
 function hasTimeHint(text) {
+  // detecta "9", "9:30", "14:00", "9am", "9 pm"
   return /\b(\d{1,2})(:\d{2})?\s*(am|pm)?\b/i.test(text);
 }
 
 function parseDateTime(text) {
+  // chrono interpreta muchas cosas en español (mañana, lunes, etc.) de forma razonable
   const results = chrono.parse(text, new Date(), { forwardDate: true });
   if (!results.length) return null;
-  return results[0].start.date();
+  return results[0].start.date(); // Date (con hora si la detecta)
 }
 
-function toUtcFromChile(dateObj) {
-  const yyyy = dateObj.getFullYear();
-  const mm = String(dateObj.getMonth() + 1).padStart(2, "0");
-  const dd = String(dateObj.getDate()).padStart(2, "0");
-  const HH = String(dateObj.getHours()).padStart(2, "0");
-  const MI = String(dateObj.getMinutes()).padStart(2, "0");
-  const local = `${yyyy}-${mm}-${dd} ${HH}:${MI}:00`;
-  return zonedTimeToUtc(local, TZ);
+function addMinutes(dateObj, minutes) {
+  return new Date(dateObj.getTime() + minutes * 60 * 1000);
 }
 
 // ===== Telegram Webhook endpoint =====
@@ -95,7 +90,7 @@ app.get("/oauth2callback", async (req, res) => {
 
     return res
       .status(200)
-      .send("Listo. Jarvis quedó autorizado. Vuelve a Telegram y usa /agenda_hoy o escribe instrucciones.");
+      .send("Listo. Jarvis quedó autorizado. Vuelve a Telegram.");
   } catch (err) {
     console.error("OAuth callback error:", err?.response?.data || err);
     return res.status(500).send("OAuth error");
@@ -106,7 +101,7 @@ app.get("/oauth2callback", async (req, res) => {
 bot.onText(/\/start/i, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "Jarvis operativo ✅\n\n1) Conecta Google: /login\n2) Ver agenda hoy: /agenda_hoy\n3) Ver pendientes: /pendientes\n\nModo asistente: escribe normal, ej:\n- reunión con BHP mañana 9\n- recordar enviar propuesta el lunes\n- llamar a René"
+    "Jarvis operativo ✅\n\nConecta Google: /login\n\nComandos:\n- /agenda_hoy\n- /pendientes\n\nModo asistente (sin /):\n- reunión con BHP mañana 9\n- recordar enviar propuesta el lunes\n- llamar a René"
   );
 });
 
@@ -184,40 +179,13 @@ bot.onText(/\/pendientes/i, async (msg) => {
     });
 
     const items = resp.data.items || [];
-    if (!items.length) return bot.sendMessage(chatId, "✅ No tienes pendientes en la lista default.");
+    if (!items.length) return bot.sendMessage(chatId, "✅ No tienes pendientes (lista default).");
 
     const lines = items.map((t) => `• ${t.title}${t.due ? ` (vence ${t.due.slice(0, 10)})` : ""}`);
     bot.sendMessage(chatId, `📝 Pendientes:\n${lines.join("\n")}`);
   } catch (err) {
     console.error(err);
     bot.sendMessage(chatId, "Error listando tareas.");
-  }
-});
-
-// Formato opcional viejo para tareas: /task texto | 2026-02-15
-bot.onText(/\/task (.+)/i, async (msg, match) => {
-  const chatId = msg.chat.id;
-  const auth = getGoogleAuth(msg.from.id);
-  if (!auth) return bot.sendMessage(chatId, "No estás logueado. Usa /login.");
-
-  try {
-    const input = match[1].trim();
-    const [titleRaw, dateRaw] = input.split("|").map((s) => s.trim());
-
-    const tasks = google.tasks({ version: "v1", auth });
-
-    const taskBody = { title: titleRaw };
-    if (dateRaw) taskBody.due = new Date(dateRaw).toISOString();
-
-    await tasks.tasks.insert({
-      tasklist: "@default",
-      requestBody: taskBody,
-    });
-
-    bot.sendMessage(chatId, `✅ Tarea creada: ${titleRaw}${dateRaw ? ` (vence ${dateRaw})` : ""}`);
-  } catch (err) {
-    console.error(err);
-    bot.sendMessage(chatId, "Error creando la tarea. Usa: /task texto | 2026-02-15");
   }
 });
 
@@ -228,7 +196,7 @@ bot.on("message", async (msg) => {
     const text = msg.text?.trim();
     if (!text) return;
 
-    // ignorar comandos (ya se manejan arriba)
+    // ignora comandos
     if (text.startsWith("/")) return;
 
     const auth = getGoogleAuth(msg.from.id);
@@ -244,26 +212,27 @@ bot.on("message", async (msg) => {
 
     if (wantsMeeting) {
       if (!parsed) {
-        return bot.sendMessage(chatId, "¿Para qué día y hora? Ej: “mañana 9:00”");
+        return bot.sendMessage(chatId, "¿Para qué día y hora? Ej: “mañana 09:00”");
       }
       if (!timePresent) {
         return bot.sendMessage(chatId, "Perfecto. ¿A qué hora? Ej: 09:00 o 14:30");
       }
 
-      const startUtc = toUtcFromChile(parsed);
-      const endUtc = new Date(startUtc.getTime() + 60 * 60 * 1000); // 1h
+      // Evento de 60 min por defecto
+      const start = parsed;
+      const end = addMinutes(start, 60);
 
       const calendar = google.calendar({ version: "v3", auth });
 
       const event = {
         summary: text,
-        start: { dateTime: startUtc.toISOString(), timeZone: TZ },
-        end: { dateTime: endUtc.toISOString(), timeZone: TZ },
+        start: { dateTime: start.toISOString(), timeZone: TZ },
+        end: { dateTime: end.toISOString(), timeZone: TZ },
         reminders: {
           useDefault: false,
           overrides: [
-            { method: "popup", minutes: 1440 },
-            { method: "popup", minutes: 60 },
+            { method: "popup", minutes: 1440 }, // 1 día antes
+            { method: "popup", minutes: 60 },   // 1 hora antes
           ],
         },
       };
@@ -276,15 +245,12 @@ bot.on("message", async (msg) => {
       return bot.sendMessage(chatId, `📅 Listo, agendado.\n${resp.data.htmlLink}`);
     }
 
-    // Si no parece reunión -> tarea
+    // Si no parece reunión, lo guardamos como tarea
     const tasks = google.tasks({ version: "v1", auth });
     const taskBody = { title: text };
 
-    // Si viene una fecha (sin hora), la ponemos como due
-    if (parsed && !timePresent) {
-      const dueUtc = toUtcFromChile(parsed);
-      taskBody.due = dueUtc.toISOString();
-    }
+    // Si detecta fecha, la usamos como due (aunque no haya hora)
+    if (parsed) taskBody.due = parsed.toISOString();
 
     await tasks.tasks.insert({
       tasklist: "@default",
