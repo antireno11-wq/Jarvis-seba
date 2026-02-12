@@ -2,14 +2,12 @@ import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 import { google } from "googleapis";
-import * as chrono from "chrono-node";
 
 dotenv.config();
 
 const app = express();
 app.use(express.json());
 
-// ===== ENV =====
 const TELEGRAM_BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN;
 const GOOGLE_CLIENT_ID = process.env.GOOGLE_CLIENT_ID;
 const GOOGLE_CLIENT_SECRET = process.env.GOOGLE_CLIENT_SECRET;
@@ -21,21 +19,16 @@ if (!GOOGLE_CLIENT_SECRET) throw new Error("Missing GOOGLE_CLIENT_SECRET");
 if (!GOOGLE_REDIRECT_URI) throw new Error("Missing GOOGLE_REDIRECT_URI");
 
 const TZ = "America/Santiago";
-
-// ===== TELEGRAM =====
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
 
-// ===== GOOGLE OAUTH =====
 const oauth2Client = new google.auth.OAuth2(
   GOOGLE_CLIENT_ID,
   GOOGLE_CLIENT_SECRET,
   GOOGLE_REDIRECT_URI
 );
 
-// Tokens en memoria (ok si te da lo mismo reloguearte)
 const userTokens = new Map(); // telegramUserId -> tokens
 
-// 🧠 Wizard para reuniones: guarda contexto día/hora
 // chatId -> { title, dateObj?: Date, stage: "need_date"|"need_time" }
 const meetingWizard = new Map();
 
@@ -52,23 +45,116 @@ function getGoogleAuth(telegramUserId) {
   return client;
 }
 
-// ===== Helpers =====
-function parseDateTime(text) {
-  const results = chrono.parse(text, new Date(), { forwardDate: true });
-  if (!results.length) return null;
-  return results[0].start.date();
+// ======= PARSER ESPAÑOL (fecha) =======
+const MONTHS = {
+  ene: 0, enero: 0,
+  feb: 1, febrero: 1,
+  mar: 2, marzo: 2,
+  abr: 3, abril: 3,
+  may: 4, mayo: 4,
+  jun: 5, junio: 5,
+  jul: 6, julio: 6,
+  ago: 7, agosto: 7,
+  sep: 8, sept: 8, septiembre: 8,
+  oct: 9, octubre: 9,
+  nov: 10, noviembre: 10,
+  dic: 11, diciembre: 11,
+};
+
+const WEEKDAYS = {
+  domingo: 0,
+  lunes: 1,
+  martes: 2,
+  miercoles: 3, miércoles: 3,
+  jueves: 4,
+  viernes: 5,
+  sabado: 6, sábado: 6,
+};
+
+function startOfDay(d) {
+  const x = new Date(d);
+  x.setHours(0, 0, 0, 0);
+  return x;
 }
 
+function addDays(d, n) {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n);
+  return x;
+}
+
+function nextWeekday(fromDate, weekdayIndex) {
+  const d = startOfDay(fromDate);
+  const diff = (weekdayIndex - d.getDay() + 7) % 7;
+  return addDays(d, diff === 0 ? 7 : diff); // próximo, no hoy mismo
+}
+
+function parseSpanishDate(text) {
+  if (!text) return null;
+  const t = text.toLowerCase().trim();
+
+  const today = startOfDay(new Date());
+
+  // relativos
+  if (/\bhoy\b/.test(t)) return today;
+  if (/\bpasado\s+mañana\b/.test(t)) return addDays(today, 2);
+  if (/\bmañana\b/.test(t)) return addDays(today, 1);
+
+  // día de semana
+  for (const [name, idx] of Object.entries(WEEKDAYS)) {
+    if (new RegExp(`\\b${name}\\b`, "i").test(t)) {
+      return nextWeekday(today, idx);
+    }
+  }
+
+  // formatos numéricos: dd/mm o dd-mm (con o sin año)
+  // 12/02, 12-02, 12/02/2026
+  let m = t.match(/\b(\d{1,2})[\/\-](\d{1,2})(?:[\/\-](\d{2,4}))?\b/);
+  if (m) {
+    const day = parseInt(m[1], 10);
+    const month = parseInt(m[2], 10) - 1;
+    let year = m[3] ? parseInt(m[3], 10) : new Date().getFullYear();
+    if (year < 100) year += 2000;
+
+    const d = new Date(year, month, day);
+    if (!isNaN(d.getTime())) return startOfDay(d);
+  }
+
+  // "12 de febrero" / "12 febrero" / "12 feb" (con o sin año)
+  // admite: 12 de febrero, 12 febrero 2026, 12 feb
+  m = t.match(/\b(\d{1,2})\s*(?:de\s*)?([a-záéíóúñ]+)\s*(?:de\s*)?(\d{4})?\b/i);
+  if (m) {
+    const day = parseInt(m[1], 10);
+    const monthKey = m[2].normalize("NFD").replace(/[\u0300-\u036f]/g, ""); // saca tildes
+    const month = MONTHS[monthKey];
+    if (month !== undefined) {
+      const year = m[3] ? parseInt(m[3], 10) : new Date().getFullYear();
+      const d = new Date(year, month, day);
+      if (!isNaN(d.getTime())) return startOfDay(d);
+    }
+  }
+
+  return null;
+}
+
+// ======= PARSER HORA =======
 function hasTime(text) {
   return /\b(\d{1,2})(:\d{2})?\s*(am|pm)?\b/i.test(text);
 }
 
 function extractHourMinute(text) {
-  const m = text.match(/\b(\d{1,2})(?::(\d{2}))?\b/);
+  // acepta: "11", "11:00", "a las 11", "11 am"
+  const m = text.match(/\b(\d{1,2})(?::(\d{2}))?\s*(am|pm)?\b/i);
   if (!m) return null;
-  const hour = parseInt(m[1], 10);
+  let hour = parseInt(m[1], 10);
   const minute = m[2] ? parseInt(m[2], 10) : 0;
-  if (hour < 0 || hour > 23 || minute < 0 || minute > 59) return null;
+  const ampm = m[3]?.toLowerCase();
+  if (minute < 0 || minute > 59) return null;
+
+  if (ampm === "pm" && hour < 12) hour += 12;
+  if (ampm === "am" && hour === 12) hour = 0;
+
+  if (hour < 0 || hour > 23) return null;
   return { hour, minute };
 }
 
@@ -89,6 +175,17 @@ function dayRange(offsetDays = 0) {
   return { start, end };
 }
 
+function fmtTime(iso) {
+  try {
+    const d = new Date(iso);
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mm = String(d.getMinutes()).padStart(2, "0");
+    return `${hh}:${mm}`;
+  } catch {
+    return iso;
+  }
+}
+
 async function createCalendarEvent(auth, title, startDate) {
   const calendar = google.calendar({ version: "v3", auth });
   const endDate = addMinutes(startDate, 60);
@@ -100,8 +197,8 @@ async function createCalendarEvent(auth, title, startDate) {
     reminders: {
       useDefault: false,
       overrides: [
-        { method: "popup", minutes: 1440 }, // 1 día antes
-        { method: "popup", minutes: 60 },   // 1 hora antes
+        { method: "popup", minutes: 1440 },
+        { method: "popup", minutes: 60 },
       ],
     },
   };
@@ -139,28 +236,14 @@ async function getAgendaAndTasks(auth, offsetDays = 0) {
 
   const tasks = tResp.data.items || [];
 
-  // Filtrar tareas con due dentro del día
   const dueTasks = tasks.filter((t) => {
     if (!t.due) return false;
     const due = new Date(t.due);
     return due >= start && due <= end;
   });
 
-  // Pendientes sin fecha (top 5)
   const noDueTasks = tasks.filter((t) => !t.due).slice(0, 5);
-
   return { events, dueTasks, noDueTasks };
-}
-
-function fmtTime(iso) {
-  try {
-    const d = new Date(iso);
-    const hh = String(d.getHours()).padStart(2, "0");
-    const mm = String(d.getMinutes()).padStart(2, "0");
-    return `${hh}:${mm}`;
-  } catch {
-    return iso;
-  }
 }
 
 // ===== WEBHOOK + HEALTH =====
@@ -168,7 +251,6 @@ app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
   res.sendStatus(200);
 });
-
 app.get("/", (req, res) => res.send("Jarvis is alive"));
 app.get("/health", (req, res) => res.send("ok"));
 
@@ -176,7 +258,7 @@ app.get("/health", (req, res) => res.send("ok"));
 app.get("/oauth2callback", async (req, res) => {
   try {
     const code = req.query.code;
-    const state = req.query.state; // telegramUserId
+    const state = req.query.state;
     if (!code || !state) return res.status(400).send("Missing code/state");
 
     const { tokens } = await oauth2Client.getToken(code);
@@ -193,13 +275,12 @@ app.get("/oauth2callback", async (req, res) => {
 bot.onText(/\/start/i, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "Jarvis operativo ✅\n\n1) Conecta Google: /login\n\nLuego habla normal:\n- Reunión mañana con Flesan\n- ¿Qué tengo hoy?\n- ¿Qué tengo mañana?\n- Recuérdame enviar propuesta el lunes"
+    "Jarvis operativo ✅\n\n1) /login\n\nEjemplos:\n- Reunión mañana con Flesan\n- Reunión 12 de febrero con Flesan\n- ¿Qué tengo hoy?\n- ¿Qué tengo mañana?\n- Recuérdame enviar propuesta el viernes"
   );
 });
 
 bot.onText(/\/login/i, (msg) => {
   const telegramUserId = String(msg.from.id);
-
   const scopes = [
     "https://www.googleapis.com/auth/calendar",
     "https://www.googleapis.com/auth/tasks",
@@ -224,21 +305,19 @@ bot.on("message", async (msg) => {
     if (textRaw.startsWith("/")) return;
 
     const auth = getGoogleAuth(msg.from.id);
-    if (!auth) return bot.sendMessage(chatId, "Primero conéctate a Google con /login.");
+    if (!auth) return bot.sendMessage(chatId, "Primero conéctate con /login.");
 
     const text = textRaw;
     const lower = text.toLowerCase();
 
-    // ========= 1) Consultas naturales de agenda =========
+    // 1) Consultas naturales de agenda
     const asksToday =
       /\b(qué|que)\b.*\b(tengo|hay)\b.*\b(hoy)\b/i.test(lower) ||
-      /\b(agenda|calendario)\b.*\b(hoy)\b/i.test(lower) ||
-      /\b(hoy)\b.*\b(reuniones|tareas|agenda)\b/i.test(lower);
+      /\b(agenda|calendario)\b.*\b(hoy)\b/i.test(lower);
 
     const asksTomorrow =
       /\b(qué|que)\b.*\b(tengo|hay)\b.*\b(mañana)\b/i.test(lower) ||
-      /\b(agenda|calendario)\b.*\b(mañana)\b/i.test(lower) ||
-      /\b(mañana)\b.*\b(reuniones|tareas|agenda)\b/i.test(lower);
+      /\b(agenda|calendario)\b.*\b(mañana)\b/i.test(lower);
 
     if (asksToday || asksTomorrow) {
       const offset = asksTomorrow ? 1 : 0;
@@ -246,8 +325,7 @@ bot.on("message", async (msg) => {
 
       const { events, dueTasks, noDueTasks } = await getAgendaAndTasks(auth, offset);
 
-      let out = `📌 Tu resumen de ${label}:\n\n`;
-
+      let out = `📌 Resumen de ${label}:\n\n`;
       out += `📅 Reuniones (${events.length}):\n`;
       if (!events.length) out += "• (sin reuniones)\n";
       for (const e of events) {
@@ -255,51 +333,35 @@ bot.on("message", async (msg) => {
         out += `• ${e.summary || "(sin título)"} — ${when ? fmtTime(when) : "sin hora"}\n`;
       }
 
-      out += `\n🧾 Tareas con vencimiento ${label} (${dueTasks.length}):\n`;
-      if (!dueTasks.length) out += "• (sin tareas con vencimiento)\n";
+      out += `\n🧾 Tareas que vencen ${label} (${dueTasks.length}):\n`;
+      if (!dueTasks.length) out += "• (sin tareas)\n";
       for (const t of dueTasks) out += `• ${t.title}\n`;
 
-      out += `\n📝 Pendientes (sin fecha) top ${noDueTasks.length}:\n`;
+      out += `\n📝 Pendientes sin fecha (top ${noDueTasks.length}):\n`;
       if (!noDueTasks.length) out += "• (sin pendientes)\n";
       for (const t of noDueTasks) out += `• ${t.title}\n`;
 
       return bot.sendMessage(chatId, out);
     }
 
-    // ========= 2) Wizard de reunión (día/hora en pasos) =========
-    // Si estamos en medio de completar una reunión
+    // 2) Wizard de reunión en pasos (día → hora)
     if (meetingWizard.has(chatId)) {
       const state = meetingWizard.get(chatId);
 
-      // Si necesita día
       if (state.stage === "need_date") {
-        const parsedDate = parseDateTime(text);
-        if (!parsedDate) {
-          return bot.sendMessage(chatId, 'No caché el día 😅. Ej: "mañana", "viernes", "12 feb".');
-        }
-        state.dateObj = parsedDate;
+        const d = parseSpanishDate(text);
+        if (!d) return bot.sendMessage(chatId, 'No caché el día 😅. Ej: "mañana", "viernes", "12 feb", "12/02".');
 
-        // Si el mensaje del usuario ya traía hora, avanzamos directo
-        if (hasTime(text)) {
-          // pero chrono a veces pone hora si viene en el texto; si no, pedimos hora igual
-          if (!hasTime(text)) {
-            state.stage = "need_time";
-            meetingWizard.set(chatId, state);
-            return bot.sendMessage(chatId, '¿A qué hora? Ej: "11" o "11:00".');
-          }
-        }
-
+        state.dateObj = d;
         state.stage = "need_time";
         meetingWizard.set(chatId, state);
-        return bot.sendMessage(chatId, 'Perfecto. ¿A qué hora? Ej: "11" o "11:00".');
+        return bot.sendMessage(chatId, 'Perfecto. ¿A qué hora? Ej: "11", "11:00", "14:30".');
       }
 
-      // Si necesita hora
       if (state.stage === "need_time") {
         const hm = extractHourMinute(text);
-        if (!hm) {
-          return bot.sendMessage(chatId, 'No entendí la hora 😅. Ej: "11", "11:00", "14:30".');
-        }
+        if (!hm) return bot.sendMessage(chatId, 'No entendí la hora 😅. Ej: "11", "11:00", "14:30".');
+
         const start = new Date(state.dateObj);
         start.setHours(hm.hour, hm.minute, 0, 0);
 
@@ -309,50 +371,56 @@ bot.on("message", async (msg) => {
       }
     }
 
-    // Detectar intención de reunión
+    // 3) Detectar reunión (mucho más flexible)
     const wantsMeeting =
       /\b(reuni[oó]n|agendar|agenda|llamada|call|cita|bloquea|bloquear)\b/i.test(lower);
 
     if (wantsMeeting) {
-      // 1) Intentar parsear todo de una vez
-      const parsed = parseDateTime(text);
+      const dateOnly = parseSpanishDate(text);
+      const timePresent = hasTime(text);
 
-      // Si no encontró ni fecha
-      if (!parsed) {
+      // Si no viene fecha -> preguntar fecha
+      if (!dateOnly) {
         meetingWizard.set(chatId, { title: text, stage: "need_date" });
-        return bot.sendMessage(chatId, '¿Para qué día? Ej: "mañana", "viernes", "12 feb".');
+        return bot.sendMessage(chatId, '¿Para qué día? Ej: "mañana", "viernes", "12 feb", "12/02".');
       }
 
-      // Si encontró fecha pero no hora => wizard a pedir hora
-      if (!hasTime(text)) {
-        meetingWizard.set(chatId, { title: text, stage: "need_time", dateObj: parsed });
-        return bot.sendMessage(chatId, 'Perfecto. ¿A qué hora? Ej: "11" o "11:00".');
+      // Si viene fecha pero no hora -> preguntar hora
+      if (!timePresent) {
+        meetingWizard.set(chatId, { title: text, stage: "need_time", dateObj: dateOnly });
+        return bot.sendMessage(chatId, 'Perfecto. ¿A qué hora? Ej: "11", "11:00", "14:30".');
       }
 
-      // Si encontró fecha y hora => crear evento directo
-      const link = await createCalendarEvent(auth, text, parsed);
+      // Fecha + hora en el mismo mensaje -> crear evento
+      const hm = extractHourMinute(text);
+      if (!hm) {
+        meetingWizard.set(chatId, { title: text, stage: "need_time", dateObj: dateOnly });
+        return bot.sendMessage(chatId, 'Entendí el día, pero no la hora. Ej: "11", "11:00".');
+      }
+
+      const start = new Date(dateOnly);
+      start.setHours(hm.hour, hm.minute, 0, 0);
+
+      const link = await createCalendarEvent(auth, text, start);
       return bot.sendMessage(chatId, `📅 Evento creado ✅\n${link}`);
     }
 
-    // ========= 3) Si no es reunión ni agenda => tarea =========
+    // 4) Si no es reunión ni agenda → tarea (pero con fecha si detecta)
     const tasksApi = google.tasks({ version: "v1", auth });
-    const parsedForTask = parseDateTime(text);
+    const dTask = parseSpanishDate(text);
     const taskBody = { title: text };
-
-    // si detecta fecha, la ponemos como due; si no, queda sin fecha
-    if (parsedForTask) taskBody.due = parsedForTask.toISOString();
+    if (dTask) taskBody.due = dTask.toISOString();
 
     await tasksApi.tasks.insert({
       tasklist: "@default",
       requestBody: taskBody,
     });
 
-    return bot.sendMessage(chatId, `✅ Listo, lo dejé como tarea${parsedForTask ? " con fecha" : ""}.`);
+    return bot.sendMessage(chatId, `✅ Listo, lo dejé como tarea${dTask ? " con fecha" : ""}.`);
   } catch (err) {
     console.error("Assistant error:", err);
   }
 });
 
-// ===== SERVER =====
 const PORT = process.env.PORT || 8080;
 app.listen(PORT, "0.0.0.0", () => console.log(`Server running on port ${PORT}`));
