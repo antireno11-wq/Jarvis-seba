@@ -2,6 +2,8 @@ import express from "express";
 import TelegramBot from "node-telegram-bot-api";
 import dotenv from "dotenv";
 import { google } from "googleapis";
+import * as chrono from "chrono-node";
+import { zonedTimeToUtc } from "date-fns-tz";
 
 dotenv.config();
 
@@ -20,6 +22,8 @@ if (!GOOGLE_CLIENT_ID) throw new Error("Missing GOOGLE_CLIENT_ID");
 if (!GOOGLE_CLIENT_SECRET) throw new Error("Missing GOOGLE_CLIENT_SECRET");
 if (!GOOGLE_REDIRECT_URI) throw new Error("Missing GOOGLE_REDIRECT_URI");
 if (!APP_BASE_URL) throw new Error("Missing APP_BASE_URL");
+
+const TZ = "America/Santiago";
 
 // ===== Telegram =====
 const bot = new TelegramBot(TELEGRAM_BOT_TOKEN);
@@ -47,6 +51,27 @@ function getGoogleAuth(telegramUserId) {
   return client;
 }
 
+// ===== Helpers NL Dates =====
+function hasTimeHint(text) {
+  return /\b(\d{1,2})(:\d{2})?\s*(am|pm)?\b/i.test(text);
+}
+
+function parseDateTime(text) {
+  const results = chrono.parse(text, new Date(), { forwardDate: true });
+  if (!results.length) return null;
+  return results[0].start.date();
+}
+
+function toUtcFromChile(dateObj) {
+  const yyyy = dateObj.getFullYear();
+  const mm = String(dateObj.getMonth() + 1).padStart(2, "0");
+  const dd = String(dateObj.getDate()).padStart(2, "0");
+  const HH = String(dateObj.getHours()).padStart(2, "0");
+  const MI = String(dateObj.getMinutes()).padStart(2, "0");
+  const local = `${yyyy}-${mm}-${dd} ${HH}:${MI}:00`;
+  return zonedTimeToUtc(local, TZ);
+}
+
 // ===== Telegram Webhook endpoint =====
 app.post("/webhook", (req, res) => {
   bot.processUpdate(req.body);
@@ -70,18 +95,18 @@ app.get("/oauth2callback", async (req, res) => {
 
     return res
       .status(200)
-      .send("Listo. Jarvis quedó autorizado. Vuelve a Telegram y usa /agenda_hoy o /pendientes.");
+      .send("Listo. Jarvis quedó autorizado. Vuelve a Telegram y usa /agenda_hoy o escribe instrucciones.");
   } catch (err) {
-    console.error("OAuth callback error:", err);
+    console.error("OAuth callback error:", err?.response?.data || err);
     return res.status(500).send("OAuth error");
   }
 });
 
-// ===== Telegram commands =====
+// ===== Commands =====
 bot.onText(/\/start/i, (msg) => {
   bot.sendMessage(
     msg.chat.id,
-    "Jarvis operativo ✅\n\n1) Conecta Google: /login\n2) Ver agenda hoy: /agenda_hoy\n3) Crear tarea: /task texto | fecha(opcional)\n4) Ver pendientes: /pendientes"
+    "Jarvis operativo ✅\n\n1) Conecta Google: /login\n2) Ver agenda hoy: /agenda_hoy\n3) Ver pendientes: /pendientes\n\nModo asistente: escribe normal, ej:\n- reunión con BHP mañana 9\n- recordar enviar propuesta el lunes\n- llamar a René"
   );
 });
 
@@ -90,27 +115,25 @@ bot.onText(/\/login/i, (msg) => {
 
   const scopes = [
     "https://www.googleapis.com/auth/calendar",
-    "https://www.googleapis.com/auth/tasks"
+    "https://www.googleapis.com/auth/tasks",
   ];
 
   const url = oauth2Client.generateAuthUrl({
     access_type: "offline",
     prompt: "consent",
     scope: scopes,
-    state: telegramUserId
+    state: telegramUserId,
   });
 
   bot.sendMessage(
     msg.chat.id,
-    `Autoriza Google (usa tu cuenta de trabajo):\n${url}\n\nCuando termines, vuelve y usa /agenda_hoy`
+    `Autoriza Google (cuenta de trabajo):\n${url}\n\nLuego vuelve y prueba /agenda_hoy o escribe “reunión con ...”`
   );
 });
 
-// Agenda de hoy (primary por ahora)
 bot.onText(/\/agenda_hoy/i, async (msg) => {
   const chatId = msg.chat.id;
   const auth = getGoogleAuth(msg.from.id);
-
   if (!auth) return bot.sendMessage(chatId, "No estás logueado. Usa /login.");
 
   try {
@@ -128,7 +151,7 @@ bot.onText(/\/agenda_hoy/i, async (msg) => {
       timeMax: end.toISOString(),
       singleEvents: true,
       orderBy: "startTime",
-      maxResults: 20
+      maxResults: 20,
     });
 
     const items = resp.data.items || [];
@@ -146,11 +169,35 @@ bot.onText(/\/agenda_hoy/i, async (msg) => {
   }
 });
 
-// Crear tarea: /task texto | 2026-02-15 (fecha opcional)
+bot.onText(/\/pendientes/i, async (msg) => {
+  const chatId = msg.chat.id;
+  const auth = getGoogleAuth(msg.from.id);
+  if (!auth) return bot.sendMessage(chatId, "No estás logueado. Usa /login.");
+
+  try {
+    const tasks = google.tasks({ version: "v1", auth });
+
+    const resp = await tasks.tasks.list({
+      tasklist: "@default",
+      showCompleted: false,
+      maxResults: 20,
+    });
+
+    const items = resp.data.items || [];
+    if (!items.length) return bot.sendMessage(chatId, "✅ No tienes pendientes en la lista default.");
+
+    const lines = items.map((t) => `• ${t.title}${t.due ? ` (vence ${t.due.slice(0, 10)})` : ""}`);
+    bot.sendMessage(chatId, `📝 Pendientes:\n${lines.join("\n")}`);
+  } catch (err) {
+    console.error(err);
+    bot.sendMessage(chatId, "Error listando tareas.");
+  }
+});
+
+// Formato opcional viejo para tareas: /task texto | 2026-02-15
 bot.onText(/\/task (.+)/i, async (msg, match) => {
   const chatId = msg.chat.id;
   const auth = getGoogleAuth(msg.from.id);
-
   if (!auth) return bot.sendMessage(chatId, "No estás logueado. Usa /login.");
 
   try {
@@ -164,7 +211,7 @@ bot.onText(/\/task (.+)/i, async (msg, match) => {
 
     await tasks.tasks.insert({
       tasklist: "@default",
-      requestBody: taskBody
+      requestBody: taskBody,
     });
 
     bot.sendMessage(chatId, `✅ Tarea creada: ${titleRaw}${dateRaw ? ` (vence ${dateRaw})` : ""}`);
@@ -174,30 +221,79 @@ bot.onText(/\/task (.+)/i, async (msg, match) => {
   }
 });
 
-// Listar pendientes
-bot.onText(/\/pendientes/i, async (msg) => {
-  const chatId = msg.chat.id;
-  const auth = getGoogleAuth(msg.from.id);
-
-  if (!auth) return bot.sendMessage(chatId, "No estás logueado. Usa /login.");
-
+// ===== Asistente conversacional (sin comandos) =====
+bot.on("message", async (msg) => {
   try {
-    const tasks = google.tasks({ version: "v1", auth });
+    const chatId = msg.chat.id;
+    const text = msg.text?.trim();
+    if (!text) return;
 
-    const resp = await tasks.tasks.list({
+    // ignorar comandos (ya se manejan arriba)
+    if (text.startsWith("/")) return;
+
+    const auth = getGoogleAuth(msg.from.id);
+    if (!auth) return bot.sendMessage(chatId, "Primero conéctate a Google con /login.");
+
+    const lower = text.toLowerCase();
+
+    const wantsMeeting =
+      /\b(reuni[oó]n|agenda|agendar|bloquea|bloquear|llamada|call|cita)\b/i.test(lower);
+
+    const parsed = parseDateTime(text);
+    const timePresent = hasTimeHint(text);
+
+    if (wantsMeeting) {
+      if (!parsed) {
+        return bot.sendMessage(chatId, "¿Para qué día y hora? Ej: “mañana 9:00”");
+      }
+      if (!timePresent) {
+        return bot.sendMessage(chatId, "Perfecto. ¿A qué hora? Ej: 09:00 o 14:30");
+      }
+
+      const startUtc = toUtcFromChile(parsed);
+      const endUtc = new Date(startUtc.getTime() + 60 * 60 * 1000); // 1h
+
+      const calendar = google.calendar({ version: "v3", auth });
+
+      const event = {
+        summary: text,
+        start: { dateTime: startUtc.toISOString(), timeZone: TZ },
+        end: { dateTime: endUtc.toISOString(), timeZone: TZ },
+        reminders: {
+          useDefault: false,
+          overrides: [
+            { method: "popup", minutes: 1440 },
+            { method: "popup", minutes: 60 },
+          ],
+        },
+      };
+
+      const resp = await calendar.events.insert({
+        calendarId: "primary",
+        requestBody: event,
+      });
+
+      return bot.sendMessage(chatId, `📅 Listo, agendado.\n${resp.data.htmlLink}`);
+    }
+
+    // Si no parece reunión -> tarea
+    const tasks = google.tasks({ version: "v1", auth });
+    const taskBody = { title: text };
+
+    // Si viene una fecha (sin hora), la ponemos como due
+    if (parsed && !timePresent) {
+      const dueUtc = toUtcFromChile(parsed);
+      taskBody.due = dueUtc.toISOString();
+    }
+
+    await tasks.tasks.insert({
       tasklist: "@default",
-      showCompleted: false,
-      maxResults: 20
+      requestBody: taskBody,
     });
 
-    const items = resp.data.items || [];
-    if (!items.length) return bot.sendMessage(chatId, "✅ No tienes pendientes en la lista default.");
-
-    const lines = items.map((t) => `• ${t.title}${t.due ? ` (vence ${t.due.slice(0, 10)})` : ""}`);
-    bot.sendMessage(chatId, `📝 Pendientes:\n${lines.join("\n")}`);
+    return bot.sendMessage(chatId, `✅ Listo, lo dejé como tarea${parsed ? " con fecha" : ""}.`);
   } catch (err) {
-    console.error(err);
-    bot.sendMessage(chatId, "Error listando tareas.");
+    console.error("Assistant error:", err);
   }
 });
 
